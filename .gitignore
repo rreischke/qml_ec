@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*.so
+
+# Large scientific data files (often exceed GitHub 100 MB limit)
+*.fits
+*.fit
+*.fz
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.pkl
+*.pickle
+
+# Project data/output directories (generated or very large)
+data/
+output/
