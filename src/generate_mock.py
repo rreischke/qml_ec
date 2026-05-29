@@ -179,26 +179,27 @@ def make_density_map(ra, dec, nside, density_fn, mask=None, smooth_fwhm_deg=10.0
     return density_map
 
 
-def compute_fkp_weights(ra, dec, density_fn, n_bar, sigma_e=0.26, C0=1e-4):
-    """FKP-like per-galaxy weights for shear (Singh 2021, Eq. 12).
+def compute_w_gamma_weights(ra, dec, density_fn, xi_eff, sigma_e=0.26):
+    """Compute shear weights using
 
-    w_i = (sigma_e^2 + n_bar * C0) / (sigma_e^2 + n_g(x_i) * C0)
+    w_gamma(theta, theta_a) = 1 / (2 sigma_e^2 + n(theta) xi_eff(theta_a)).
 
     Parameters
     ----------
     ra, dec    : degrees
-    density_fn : callable(ra, dec) → local number density n_g at each position,
-                 in the same units as n_bar
-    n_bar      : float, mean galaxy number density over the survey footprint
+    density_fn : callable(ra, dec) → local number density n_g
+    xi_eff     : float or array of shape (n_bins,)
+                 Effective signal ξ_eff(θ_a) = (1/2π)∫ ℓ dℓ C_ℓ J_{0/4}(ℓθ_a)
+                 evaluated at TreeCorr bin centres via xi_pm_theory.
     sigma_e    : float, per-component shape noise (default 0.26)
-    C0         : float, power spectrum amplitude at the reference scale ell_0
 
     Returns
     -------
-    w : array of shape (n,)
+    w : (n_gal,) if xi_eff is scalar, (n_gal, n_bins) if xi_eff is an array
     """
-    ng = np.asarray(density_fn(ra, dec), dtype=float)
-    return (sigma_e**2 + n_bar * C0) / (sigma_e**2 + ng * C0)
+    ng     = np.asarray(density_fn(ra, dec), dtype=float)       # (n_gal,)
+    xi_eff = np.atleast_1d(np.asarray(xi_eff, dtype=float))     # (n_bins,)
+    return 1.0 / (2.0 * sigma_e**2 + ng[:, None] * xi_eff[None, :])
 
 
 def measure_xi_pm(ra, dec, g1, g2, w=None,
@@ -210,8 +211,10 @@ def measure_xi_pm(ra, dec, g1, g2, w=None,
 
     Parameters
     ----------
-    w : array-like, optional
-        Per-galaxy weights passed to TreeCorr. If None, uniform weights are used.
+    w : None, (n_gal,), or (n_gal, n_bins)
+        Per-galaxy weights. If shape is (n_gal, n_bins) (scale-dependent w_gamma),
+        TreeCorr is run once per bin using w[:, b] and only bin b is retained,
+        implementing the per-band weight of Eq. 11.
 
     Returns
     -------
@@ -219,6 +222,26 @@ def measure_xi_pm(ra, dec, g1, g2, w=None,
     xi_p, xi_m : measured ξ+, ξ−
     err_p, err_m : 1σ errors from TreeCorr's variance estimate
     """
+    # Scale-dependent weights: run TreeCorr once per bin, keep that bin.
+    if w is not None and np.ndim(w) == 2:
+        n_bins = w.shape[1]
+        theta_arr = np.empty(n_bins)
+        xip_arr   = np.empty(n_bins)
+        xim_arr   = np.empty(n_bins)
+        errp_arr  = np.empty(n_bins)
+        errm_arr  = np.empty(n_bins)
+        for b in range(n_bins):
+            t, xp, xm, ep, em = measure_xi_pm(
+                ra, dec, g1, g2, w=w[:, b],
+                min_sep=min_sep, max_sep=max_sep,
+                nbins=n_bins, bin_slop=bin_slop)
+            theta_arr[b] = t[b]
+            xip_arr[b]   = xp[b]
+            xim_arr[b]   = xm[b]
+            errp_arr[b]  = ep[b]
+            errm_arr[b]  = em[b]
+        return theta_arr, xip_arr, xim_arr, errp_arr, errm_arr
+
     # HEALPy IAU: Q>0 is N-S, U>0 is NE-SW from N.
     # TreeCorr:   g1>0 is E-W, g2>0 is NE-SW from E.  → g1 = -Q
     cat = treecorr.Catalog(ra=ra, dec=dec, g1=-g1, g2=g2, w=w,
@@ -239,17 +262,19 @@ if __name__ == '__main__':
     NSIDE      = 256
     N_GAL      = 200_000
     N_REAL     = 1000
-    C0         = 1e-4#cl_EE_extrap(50)   # FKP reference power spectrum amplitude
-    USE_FKP    = True   # set False for uniform weights
+    USE_W_GAMMA = True  # set False for uniform weights
     CRAZY_MASK = True  # set True to add 500 random bright-star-style holes
-    DENSITY_SMOOTH_FWHM_DEG = 10.0  # smoothing scale for local density used in FKP
+    DENSITY_SMOOTH_FWHM_DEG = 10.0  # smoothing scale for local density used in w_gamma
+    MIN_SEP_ARCMIN = 3 * 10800.0 / NSIDE   # ell < NSIDE → pixel effects negligible
+    MAX_SEP_ARCMIN = 400.0
+    NBINS          = 8
 
     PLOT_DIR = Path("./../plots")
     OUT_DIR  = Path("./../output")
     PLOT_DIR.mkdir(exist_ok=True)
     OUT_DIR.mkdir(exist_ok=True)
 
-    tag      = ('fkp' if USE_FKP else 'uniform') + ('_crazy' if CRAZY_MASK else '')
+    tag      = ('wgamma' if USE_W_GAMMA else 'uniform') + ('_crazy' if CRAZY_MASK else '')
     out_file = OUT_DIR / f"xi_pm_realisations_{tag}.npz"
 
     pixel_size_arcmin = hp.nside2resol(NSIDE, arcmin=True)
@@ -267,7 +292,7 @@ if __name__ == '__main__':
     dec = 90.0 - np.degrees(theta_pix)
 
     # Build a spatially varying local-density estimate from sampled positions.
-    # This makes FKP weights respond to survey depth/coverage fluctuations.
+    # This makes w_gamma respond to survey depth/coverage fluctuations.
     npix = hp.nside2npix(NSIDE)
     counts_map = np.bincount(chosen, minlength=npix).astype(float)
     density_template = hp.smoothing(
@@ -284,11 +309,15 @@ if __name__ == '__main__':
     n_bar = float(density_fn(ra, dec).mean())
     print(f"Local-density template ready (FWHM={DENSITY_SMOOTH_FWHM_DEG:.1f} deg): n_bar={n_bar:.4e}")
 
-    # ---- theory curve computed once ----
+    # ---- theory ξ± at TreeCorr bin centres (fixed geometry) ----
     print("Computing theory ξ± …")
-    # placeholder theta grid; refined after first TreeCorr call
-    theta_th_arcmin = None
-    xi_p_th = xi_m_th = None
+    theta_cents_arcmin = np.geomspace(MIN_SEP_ARCMIN, MAX_SEP_ARCMIN, NBINS)
+    xi_p_th, xi_m_th   = xi_pm_theory(theta_cents_arcmin / 60.0)
+    theta_th_arcmin    = theta_cents_arcmin
+
+    # xi_eff(theta_a) from theory xi prediction.
+    # Use a positive effective amplitude to keep the denominator stable.
+    xi_eff = 0.5 * (np.abs(xi_p_th) + np.abs(xi_m_th))   # shape (NBINS,)
 
     # ---- accumulate results ----
     all_xip   = []
@@ -303,11 +332,12 @@ if __name__ == '__main__':
         g1, g2 = Q[chosen], U[chosen]
         if i_real == 0:
             sigma_e = np.sqrt(0.5 * (np.var(g1) + np.var(g2)))
-        if USE_FKP:
-            fkp_w   = compute_fkp_weights(ra, dec, density_fn, n_bar,
-                                          sigma_e=sigma_e, C0=C0)
+        if USE_W_GAMMA:
+            w_gamma = compute_w_gamma_weights(ra, dec, density_fn, xi_eff,
+                                              sigma_e=sigma_e)
+            # w_gamma shape: (n_gal, NBINS)
         else:
-            fkp_w = None
+            w_gamma = None
 
         # ---- plots for first realisation only ----
         if i_real == 0:
@@ -349,47 +379,53 @@ if __name__ == '__main__':
             plt.close()
             print("Saved emode_mock.pdf")
 
-            if USE_FKP and fkp_w is not None:
+            if USE_W_GAMMA and w_gamma is not None:
+                # w_gamma has shape (n_gal, NBINS); use middle bin as representative
+                mid = w_gamma.shape[1] // 2
+                w_mid = w_gamma[:, mid]
+                theta_mid = theta_cents_arcmin[mid]
                 print(
-                    "FKP weight stats: "
-                    f"min={np.min(fkp_w):.4f}, max={np.max(fkp_w):.4f}, "
-                    f"std={np.std(fkp_w):.4f}"
+                    f"w_gamma stats (bin {mid}, θ≈{theta_mid:.1f}'): "
+                    f"min={w_mid.min():.4e}, max={w_mid.max():.4e}, "
+                    f"std={w_mid.std():.4e}"
                 )
-                # Histogram of per-galaxy FKP weights.
+                # Histogram of per-galaxy weights for each bin.
                 fig, ax = plt.subplots(figsize=(7.5, 5.0))
-                ax.hist(fkp_w, bins=80, density=True, histtype="stepfilled", alpha=0.45,
-                        color="tab:blue", edgecolor="tab:blue")
-                ax.axvline(np.mean(fkp_w), color="k", ls="--", lw=1.2,
-                           label=fr"mean={np.mean(fkp_w):.3f}")
-                ax.set_xlabel("FKP weight")
+                colors = plt.cm.viridis(np.linspace(0.1, 0.9, NBINS))
+                for b in range(NBINS):
+                    ax.hist(w_gamma[:, b], bins=80, density=True, histtype="step",
+                            color=colors[b],
+                            label=fr"$\theta_a={theta_cents_arcmin[b]:.0f}'$")
+                ax.set_xlabel(r"$w_\gamma$")
                 ax.set_ylabel("PDF")
-                ax.set_title("FKP weight distribution (realisation 1)")
+                ax.set_title(r"$w_\gamma$ distribution per bin (realisation 1)")
                 ax.grid(True, alpha=0.25)
-                ax.legend(frameon=False)
+                ax.legend(frameon=False, fontsize=7, ncol=2)
                 plt.tight_layout()
-                plt.savefig(PLOT_DIR / "fkp_weight_histogram.pdf", dpi=150, bbox_inches="tight")
+                plt.savefig(PLOT_DIR / "w_gamma_histogram.pdf", dpi=150, bbox_inches="tight")
                 plt.close()
-                print("Saved fkp_weight_histogram.pdf")
+                print("Saved w_gamma_histogram.pdf")
 
-                # HEALPix map of mean FKP weight per occupied pixel.
-                npix = hp.nside2npix(NSIDE)
-                w_sum = np.bincount(chosen, weights=fkp_w, minlength=npix).astype(float)
-                w_cnt = np.bincount(chosen, minlength=npix).astype(float)
-                w_map = np.full(npix, hp.UNSEEN)
+                # HEALPix map of mean weight (averaged over bins) per pixel.
+                npix_plot = hp.nside2npix(NSIDE)
+                w_mean_gal = w_gamma.mean(axis=1)
+                w_sum = np.bincount(chosen, weights=w_mean_gal, minlength=npix_plot).astype(float)
+                w_cnt = np.bincount(chosen, minlength=npix_plot).astype(float)
+                w_map = np.full(npix_plot, hp.UNSEEN)
                 occupied = w_cnt > 0
                 w_map[occupied] = w_sum[occupied] / w_cnt[occupied]
 
-                hp.mollview(w_map, title="Mean FKP weight per pixel (realisation 1)",
-                            unit="w_FKP", cmap="viridis")
-                plt.savefig(PLOT_DIR / "fkp_weight_map.pdf", dpi=150, bbox_inches="tight")
+                hp.mollview(w_map, title=r"Mean $w_\gamma$ per pixel (realisation 1)",
+                            unit=r"$\langle w_\gamma\rangle$", cmap="viridis")
+                plt.savefig(PLOT_DIR / "w_gamma_map.pdf", dpi=150, bbox_inches="tight")
                 plt.close()
-                print("Saved fkp_weight_map.pdf")
+                print("Saved w_gamma_map.pdf")
 
         # ---- measure ξ± ----
         # pixel window function W_ell ~ 1 only for ell < NSIDE;
         # corresponding angular scale: theta > pi/NSIDE rad = 10800/NSIDE arcmin
         theta_meas, xi_p, xi_m, err_p, err_m = measure_xi_pm(
-            ra, dec, g1, g2, w=fkp_w,
+            ra, dec, g1, g2, w=w_gamma,
             min_sep=3*10800.0 / NSIDE, max_sep=400.0, nbins=8,
         )
 
@@ -434,7 +470,7 @@ if __name__ == '__main__':
                  theta=theta_out,
                  xip=np.array(all_xip),
                  xim=np.array(all_xim),
-                 use_fkp=USE_FKP,
+                 use_fkp=USE_W_GAMMA,
                  theta_th=theta_th_arcmin,
                  xi_p_th=xi_p_th,
                  xi_m_th=xi_m_th)
