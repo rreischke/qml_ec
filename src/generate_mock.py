@@ -236,23 +236,25 @@ def measure_xi_pm(ra, dec, g1, g2, w=None,
 # Multi-realisation runner
 # ---------------------------------------------------------------------------
 if __name__ == '__main__':
-    NSIDE   = 256
-    N_GAL   = 200_000
-    N_REAL  = 1000
-    C0      = cl_EE_extrap(50)   # FKP reference power spectrum amplitude
-    USE_FKP = True   # set False for uniform weights
+    NSIDE      = 256
+    N_GAL      = 200_000
+    N_REAL     = 1000
+    C0         = cl_EE_extrap(50)   # FKP reference power spectrum amplitude
+    USE_FKP    = True   # set False for uniform weights
+    CRAZY_MASK = False  # set True to add 500 random bright-star-style holes
 
     PLOT_DIR = Path("./../plots")
     OUT_DIR  = Path("./../output")
     OUT_DIR.mkdir(exist_ok=True)
 
-    out_file = OUT_DIR / f"xi_pm_realisations_{'fkp' if USE_FKP else 'uniform'}.npz"
+    tag      = ('fkp' if USE_FKP else 'uniform') + ('_crazy' if CRAZY_MASK else '')
+    out_file = OUT_DIR / f"xi_pm_realisations_{tag}.npz"
 
     pixel_size_arcmin = hp.nside2resol(NSIDE, arcmin=True)
 
     # ---- fixed mask and galaxy positions (sampled once) ----
     print("Building mask …")
-    mask  = make_mask(NSIDE)
+    mask  = make_mask(NSIDE, n_holes=500 if CRAZY_MASK else 0, seed=0)
     valid = np.where(mask > 0)[0]
 
     print(f"Sampling {N_GAL} positions …")
