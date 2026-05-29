@@ -9,7 +9,7 @@ import treecorr
 import healpy as hp
 import euclidlib as el
 
-cls = el.le3.pk_wl.angular_power_spectra("/Users/robert/Documents/Git/qml_ec/data/theory_for_fit.fits")
+cls = el.le3.pk_wl.angular_power_spectra("/net/home/fohlen13/reischke/Git/qml_ec/data/theory_for_fit.fits")
 
 cls_data = cls[('SHE', 'SHE', 1, 1)].array[0,0,:]
 ell_data = cls[('SHE', 'SHE', 1, 1)].ell
@@ -239,12 +239,14 @@ if __name__ == '__main__':
     NSIDE      = 256
     N_GAL      = 200_000
     N_REAL     = 1000
-    C0         = cl_EE_extrap(50)   # FKP reference power spectrum amplitude
+    C0         = 1e-4#cl_EE_extrap(50)   # FKP reference power spectrum amplitude
     USE_FKP    = True   # set False for uniform weights
-    CRAZY_MASK = False  # set True to add 500 random bright-star-style holes
+    CRAZY_MASK = True  # set True to add 500 random bright-star-style holes
+    DENSITY_SMOOTH_FWHM_DEG = 10.0  # smoothing scale for local density used in FKP
 
     PLOT_DIR = Path("./../plots")
     OUT_DIR  = Path("./../output")
+    PLOT_DIR.mkdir(exist_ok=True)
     OUT_DIR.mkdir(exist_ok=True)
 
     tag      = ('fkp' if USE_FKP else 'uniform') + ('_crazy' if CRAZY_MASK else '')
@@ -264,9 +266,23 @@ if __name__ == '__main__':
     ra  = np.degrees(phi_pix)
     dec = 90.0 - np.degrees(theta_pix)
 
-    # density function fixed since positions don't change
-    density_fn = lambda ra, _dec: np.ones(len(ra))   # replace with real estimator
+    # Build a spatially varying local-density estimate from sampled positions.
+    # This makes FKP weights respond to survey depth/coverage fluctuations.
+    npix = hp.nside2npix(NSIDE)
+    counts_map = np.bincount(chosen, minlength=npix).astype(float)
+    density_template = hp.smoothing(
+        counts_map,
+        fwhm=np.radians(DENSITY_SMOOTH_FWHM_DEG),
+        verbose=False,
+    )
+    density_template = np.clip(density_template, 1e-12, None)
+
+    def density_fn(ra_eval, dec_eval):
+        pix_eval = hp.ang2pix(NSIDE, np.radians(90.0 - dec_eval), np.radians(ra_eval))
+        return density_template[pix_eval]
+
     n_bar = float(density_fn(ra, dec).mean())
+    print(f"Local-density template ready (FWHM={DENSITY_SMOOTH_FWHM_DEG:.1f} deg): n_bar={n_bar:.4e}")
 
     # ---- theory curve computed once ----
     print("Computing theory ξ± …")
@@ -285,9 +301,9 @@ if __name__ == '__main__':
         # regenerate field only; positions stay fixed
         Q, U = generate_emode_maps(NSIDE)
         g1, g2 = Q[chosen], U[chosen]
-
-        if USE_FKP:
+        if i_real == 0:
             sigma_e = np.sqrt(0.5 * (np.var(g1) + np.var(g2)))
+        if USE_FKP:
             fkp_w   = compute_fkp_weights(ra, dec, density_fn, n_bar,
                                           sigma_e=sigma_e, C0=C0)
         else:
@@ -295,7 +311,13 @@ if __name__ == '__main__':
 
         # ---- plots for first realisation only ----
         if i_real == 0:
-            density_map = make_density_map(ra, dec, NSIDE, density_fn, mask=mask)
+            density_map = make_density_map(
+                ra,
+                dec,
+                NSIDE,
+                density_fn=lambda ra_loc, dec_loc: np.ones(len(ra_loc)),
+                mask=mask,
+            )
 
             hp.mollview(density_map, title="Local galaxy density",
                         unit=r"$n$ [arb.]", cmap="magma")
@@ -326,6 +348,42 @@ if __name__ == '__main__':
             plt.savefig(PLOT_DIR / "emode_mock.pdf", dpi=150, bbox_inches="tight")
             plt.close()
             print("Saved emode_mock.pdf")
+
+            if USE_FKP and fkp_w is not None:
+                print(
+                    "FKP weight stats: "
+                    f"min={np.min(fkp_w):.4f}, max={np.max(fkp_w):.4f}, "
+                    f"std={np.std(fkp_w):.4f}"
+                )
+                # Histogram of per-galaxy FKP weights.
+                fig, ax = plt.subplots(figsize=(7.5, 5.0))
+                ax.hist(fkp_w, bins=80, density=True, histtype="stepfilled", alpha=0.45,
+                        color="tab:blue", edgecolor="tab:blue")
+                ax.axvline(np.mean(fkp_w), color="k", ls="--", lw=1.2,
+                           label=fr"mean={np.mean(fkp_w):.3f}")
+                ax.set_xlabel("FKP weight")
+                ax.set_ylabel("PDF")
+                ax.set_title("FKP weight distribution (realisation 1)")
+                ax.grid(True, alpha=0.25)
+                ax.legend(frameon=False)
+                plt.tight_layout()
+                plt.savefig(PLOT_DIR / "fkp_weight_histogram.pdf", dpi=150, bbox_inches="tight")
+                plt.close()
+                print("Saved fkp_weight_histogram.pdf")
+
+                # HEALPix map of mean FKP weight per occupied pixel.
+                npix = hp.nside2npix(NSIDE)
+                w_sum = np.bincount(chosen, weights=fkp_w, minlength=npix).astype(float)
+                w_cnt = np.bincount(chosen, minlength=npix).astype(float)
+                w_map = np.full(npix, hp.UNSEEN)
+                occupied = w_cnt > 0
+                w_map[occupied] = w_sum[occupied] / w_cnt[occupied]
+
+                hp.mollview(w_map, title="Mean FKP weight per pixel (realisation 1)",
+                            unit="w_FKP", cmap="viridis")
+                plt.savefig(PLOT_DIR / "fkp_weight_map.pdf", dpi=150, bbox_inches="tight")
+                plt.close()
+                print("Saved fkp_weight_map.pdf")
 
         # ---- measure ξ± ----
         # pixel window function W_ell ~ 1 only for ell < NSIDE;
